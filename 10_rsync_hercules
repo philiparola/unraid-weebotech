@@ -1,0 +1,143 @@
+#!/bin/bash
+
+if [ ${DEBUG:=0} -gt 0 ]
+   then set -x -v
+fi
+
+P=${0##*/}              # basename of program
+R=${0%%$P}              # dirname of program
+P=${P%.*}               # strip off after last . character
+P=${P#*_*}              # Strip off crondir order prefix
+
+RC=0
+ERC=0
+ISODATE="`date +'%F'`"
+YYYYMMDD="`date '+%Y%m%d'`"
+YYYYMMDDHHMM="`date '+%Y%m%d%H%M'`"
+TMPFILE=/tmp/${P}.$$
+
+trap "rm -f ${TMPFILE}" EXIT HUP INT QUIT TERM
+
+BACKUPROOT=/mnt/disk2/backups
+BACKUPDEST=hercules
+BACKUPDIR=${BACKUPROOT}/${BACKUPDEST}
+BACKUPDATEMASK=${YYYYMMDD}
+BACKUPDIRD=${BACKUPDIR}/${BACKUPDATEMASK}
+BACKUPSRC[0]="hercules:/etc"
+BACKUPSRC[1]="hercules:/var"
+BACKUPSRC[2]="hercules:/usr"
+BACKUPSRC[3]="hercules:/opt"
+# BACKUPSRC[4]="hercules:/hercules/xu"
+# BACKUPSRC[5]="hercules:/hercules/shared"
+
+LOGFILE=${BACKUPDIR}/log/${P}.${BACKUPDATEMASK}.log
+
+
+CONFDIR=${R%/*}
+if [ ${CONFDIR} = "." ]; then 
+   if [ -f "${CONFDIR}/${P}.conf" ]
+      then source ${CONFDIR}/${P}.conf
+      else CONFDIR=".."
+   fi
+fi
+CONFDIR="${CONFDIR%/*}/etc"
+if [ -f ${CONFDIR}/${P}.conf ]; then 
+   source ${CONFDIR}/${P}.conf
+fi
+
+log()
+{
+    : ${SYSHOSTNAME:=`hostname`}
+    echo "`date '+%b %d %T'` ${SYSHOSTNAME} $P[$$]: " $@
+}
+
+exec 3>&1
+
+tty >/dev/null 2>&1
+if [ $? -eq 0 ]
+   then export NULL=""
+	# export RSYNCOPTS="-v --progress --stats"
+   else export NULL=""
+	# export RSYNCOPTS="-v"
+        exec 1>>${LOGFILE}
+        exec 2>&1
+fi
+
+
+log "Starting."
+
+cd ${BACKUPROOT} || {
+    log "cannot chdir(${BACKUPROOT} to backup root"
+    exit 1
+}
+
+[ ! -d ${BACKUPDIR}     ] && mkdir -p ${BACKUPDIR}
+[ ! -d ${BACKUPDIR}/log ] && mkdir -p ${BACKUPDIR}/log
+[ ! -d ${BACKUPDIRD}    ] && mkdir -p ${BACKUPDIRD}
+
+
+export LAST_BACKUP_DATE=""
+# Find last backup (but skip if current)
+ls -1t ${BACKUPDIR} | grep '[0-9]' | head -2 > ${TMPFILE} 
+while read LAST_BACKUP
+do  if [ "${LAST_BACKUP}" = "${BACKUPDATEMASK}" ]
+       then continue
+    fi
+    export LAST_BACKUP_DATE=${LAST_BACKUP}
+done < ${TMPFILE}
+rm -f ${TMPFILE}
+
+if [ ${DEBUG:=0} -gt 0 ]
+   then RSYNCOPTS="${RSYNCOPTS} -n"
+fi
+
+BWLIMIT="--bwlimit ${BWLIMIT:=8192}"
+FILTER="--filter=': /.rsync-filter'"
+
+RSYNCOPTS="${RSYNCOPTS} -x"
+RSYNCOPTS="${RSYNCOPTS} -h"
+# RSYNCOPTS="${RSYNCOPTS} -i"
+RSYNCOPTS="${RSYNCOPTS} --delete"
+RSYNCOPTS="${RSYNCOPTS} --delete-excluded"
+RSYNCOPTS="${RSYNCOPTS} --numeric-ids"
+RSYNCOPTS="${RSYNCOPTS} --log-file=${LOGFILE}.tmp"
+# RSYNCOPTS="${RSYNCOPTS} --filter ${CONFDIR}/${P}.rsync-filter"
+# RSYNCOPTS="${RSYNCOPTS} ${FILTER}"
+RSYNCOPTS="${RSYNCOPTS} ${BWLIMIT}"
+
+RSYNC_RSH=ssh
+export RSYNC_RSH
+
+if [ ! -z "${LAST_BACKUP_DATE}" ]
+   then RSYNCOPTS="${RSYNCOPTS} --link-dest=${BACKUPDIR}/${LAST_BACKUP_DATE}"
+	log "Backing up changes since: ${LAST_BACKUP_DATE}"
+fi
+
+log "Backup to: ${BACKUPDIRD}"
+
+trap "rm -f ${TMPFILE} ${LOGFILE}.tmp" EXIT HUP INT QUIT TERM
+set -x
+nice ionice -c3 rsync -aW ${RSYNCOPTS} ${BACKUPSRC[*]} ${BACKUPDIRD}
+set +x
+
+
+# eval nice -$NICE $RSYNC -va $OPTS --exclude-from=${R}/etc/${P}.exclude --delete --delete-excluded \
+#	--numeric-ids --link-dest=../1 $FILESYSTEMS $REMOTEDEVICE/0 > $LOGFILE 2>&1
+
+RC=$?
+if [ ${RC} -gt ${ERC} ]
+   then ERC=${RC}
+fi
+
+if [ -f ${LOGFILE}.tmp ]
+   then cat ${LOGFILE}.tmp >> ${LOGFILE}
+        rm -f ${LOGFILE}.tmp
+fi
+
+log "Ending: RC: ${ERC}"
+
+if [ ${ERC} -gt 0 ]
+   then cat ${LOGFILE} >&3
+fi
+
+exit ${ERC}

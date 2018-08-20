@@ -1,0 +1,213 @@
+#!/bin/bash
+
+if [ ${DEBUG:=0} -gt 0 ]
+   then set -x -v
+fi
+
+P=${0##*/}              # basename of program
+R=${0%%$P}              # dirname of program
+P=${P%.*}               # strip off after last . character
+P=${P#*_*}              # Strip off crondir order prefix
+
+RC=0
+ERC=0
+ISODATE="`date +'%F'`"
+YYYYMMDD="`date '+%Y%m%d'`"
+YYYYMMDDHHMM="`date '+%Y%m%d%H%M'`"
+TMPFILE=/tmp/${P}.$$
+
+BACKUPDATEMASK=${YYYYMMDD}
+
+trap "rm -f ${TMPFILE}" EXIT HUP INT QUIT TERM
+
+log()
+{
+    : ${SYSHOSTNAME:=`hostname`}
+    echo "`date '+%b %d %T'` ${SYSHOSTNAME} $P[$$]: " $@
+}
+
+# Configuration items which should exist in conf file
+# BACKUPROOT=/mnt/disk2/backups
+# BACKUPDEST=hostname
+# BACKUPSRC[0]="hostname.domain.com:/"
+# BACKUPSRC[1]="hostname.domain.com:/boot"
+# BACKUPSRC[2]="hostname.domain.com:/mnt/cache/.home"
+
+# - OPTIONS TO LOAD A CONFIGURATION FILE # 
+
+CONFDIR=${R%/*}
+if [ ${CONFDIR} = "." ]; then 
+   if [ -f "${CONFDIR}/${P}.conf" ]
+      then CONFFILE="${CONFDIR}/${P}.conf"
+	   source ${CONFFILE}
+	   # log "loading configuration: ${CONFDIR}/${P}.conf"
+      else CONFDIR=".."
+   fi
+fi
+
+CONFDIR="${CONFDIR%/*}/etc"
+if [ -f "${CONFDIR}/${P}.conf" ]
+   then CONFFILE="${CONFDIR}/${P}.conf"
+        source ${CONFFILE}
+	# log "loading configuration: ${CONFDIR}/${P}.conf"  
+fi
+
+CONFDIR="${CONFDIR%/*}/etc"
+if [ -f "${CONFDIR}/${P}.conf" ]
+   then CONFFILE="${CONFDIR}/${P}.conf"
+        source ${CONFFILE}
+	# log "loading configuration: ${CONFDIR}/${P}.conf"  
+fi
+
+
+# Supplied on command line as first argument?
+if [ ! -z "${1}" ]; then
+   if [ -f "${1}" ]; then 
+      CONFFILE="${1}"
+      source "${CONFFILE}"
+      # log "loading configuration: ${1}"
+   fi
+fi
+
+BACKUPDIR=${BACKUPROOT}/${BACKUPDEST}
+BACKUPDIRD=${BACKUPDIR}/${BACKUPDATEMASK}
+
+if [ ! -z "${CONFFILE}" ]
+   then C=${CONFFILE##*/}       # basename of file
+	CR=${CONFFILE%%$C}      # dirname of file
+	C=${C%.*}               # strip off after last . character
+        LOGFILE=${BACKUPDIR}/log/${C}.${BACKUPDATEMASK}.log
+fi
+
+if [ -z "${LOGFILE}" ]
+   then LOGFILE=${BACKUPDIR}/log/${P}.${BACKUPDATEMASK}.log
+fi
+
+if [ -z "${BACKUPROOT}" ]
+   then echo "$0: BACKUPROOT= directory not loaded from conf file[s]"
+        exit
+fi
+
+if [ -z "${BACKUPDEST}" ]
+   then echo "$0: BACKUPDEST= directory not loaded from conf file[s]"
+        exit
+fi
+
+if [ -z "${BACKUPSRC[*]}" ]
+   then echo "$0: BACKUPSRC[#]= directores not loaded from conf file[s]"
+        exit
+fi
+
+if [ ${DEBUG:=0} -gt 0 ]; then 
+   echo "CONFFILE=${CONFFILE}"
+   echo "BACKUPDIR=${BACKUPDIR}"
+   echo "BACKUPDIRD=${BACKUPDIRD}"
+   echo "LOGFILE=${LOGFILE}"
+   echo "BACKUPSRC[*]=${BACKUPSRC[*]}"
+fi
+
+exec 3>&1	# Save STDOUT to FD 3
+
+# running on terminal or background process?
+tty >/dev/null 2>&1
+if [ $? -eq 0 ]
+   then export NULL=""
+	# export RSYNCOPTS="-v --progress --stats"
+   else export NULL=""
+	# export RSYNCOPTS="-v"
+        exec 1>>${LOGFILE}
+        exec 2>&1
+fi
+
+log "Starting."
+log " conf: ${CONFFILE}"
+log " Log: ${LOGFILE}"
+
+cd ${BACKUPROOT} || {
+    log "cannot chdir(${BACKUPROOT} to backup root"
+    exit 1
+}
+
+[ ! -d ${BACKUPDIR}     ] && mkdir -p ${BACKUPDIR}
+[ ! -d ${BACKUPDIR}/log ] && mkdir -p ${BACKUPDIR}/log
+[ ! -d ${BACKUPDIRD}    ] && mkdir -p ${BACKUPDIRD}
+
+for BACKUPSRC_DIR in ${BACKUPSRC[*]}
+do log " backing up directory: ${BACKUPSRC_DIR}"
+done 
+unset BACKUPSRC_DIR
+
+export LAST_BACKUP_DATE=""
+# Find last backup (but skip if current)
+ls -1  ${BACKUPDIR} | sort | grep '[0-9]' | tail -2 > ${TMPFILE}
+while read LAST_BACKUP
+do  if [ "${LAST_BACKUP}" = "${BACKUPDATEMASK}" ]
+       then continue
+    fi
+    export LAST_BACKUP_DATE=${LAST_BACKUP}
+done < ${TMPFILE}
+rm -f ${TMPFILE}
+
+if [ ${DEBUG:=0} -gt 0 ]
+   then RSYNCOPTS="${RSYNCOPTS} -n"
+fi
+
+BWLIMIT="--bwlimit ${BWLIMIT:=32768}"
+FILTER="--filter=': /.rsync-filter'"
+
+RSYNCOPTS="${RSYNCOPTS} -x"
+RSYNCOPTS="${RSYNCOPTS} -h"
+# RSYNCOPTS="${RSYNCOPTS} -i"
+RSYNCOPTS="${RSYNCOPTS} --delete"
+RSYNCOPTS="${RSYNCOPTS} --delete-excluded"
+RSYNCOPTS="${RSYNCOPTS} --numeric-ids"
+RSYNCOPTS="${RSYNCOPTS} --log-file=${LOGFILE}.tmp"
+# RSYNCOPTS="${RSYNCOPTS} --filter ${CONFDIR}/${P}.rsync-filter"
+# RSYNCOPTS="${RSYNCOPTS} ${FILTER}"
+RSYNCOPTS="${RSYNCOPTS} ${BWLIMIT}"
+
+export RSYNC_RSH=ssh
+
+if [ ! -z "${LAST_BACKUP_DATE}" ]
+   then RSYNCOPTS="${RSYNCOPTS} --link-dest=${BACKUPDIR}/${LAST_BACKUP_DATE}"
+	log "Backing up changes since: ${LAST_BACKUP_DATE}"
+fi
+
+log "Backup to: ${BACKUPDIRD}"
+
+trap "rm -f ${TMPFILE} ${LOGFILE}.tmp" EXIT HUP INT QUIT TERM
+
+# set -x
+# Save Kernel Options.
+swappiness=$(</proc/sys/vm/swappiness)
+cachepressure=$(</proc/sys/vm/vfs_cache_pressure)
+
+echo 3              > /proc/sys/vm/drop_caches
+echo 100            > /proc/sys/vm/swappiness
+echo 200            > /proc/sys/vm/vfs_cache_pressure
+
+nice ionice -c3 rsync -aW ${RSYNCOPTS} ${BACKUPSRC[*]} ${BACKUPDIRD}
+RC=$?
+[ ${RC} -gt ${ERC} ] && ERC=${RC}
+
+echo 3              > /proc/sys/vm/drop_caches
+echo $swappiness    > /proc/sys/vm/swappiness
+echo $cachepressure > /proc/sys/vm/vfs_cache_pressure
+
+# set +x
+# eval nice -$NICE $RSYNC -va $OPTS --exclude-from=${R}/etc/${P}.exclude --delete --delete-excluded \
+#	--numeric-ids --link-dest=../1 $FILESYSTEMS $REMOTEDEVICE/0 > $LOGFILE 2>&1
+
+
+if [ -f ${LOGFILE}.tmp ]
+   then cat ${LOGFILE}.tmp >> ${LOGFILE}
+        rm -f ${LOGFILE}.tmp
+fi
+
+log "Ending: RC: ${ERC}"
+
+if [ ${ERC} -gt 0 ]
+   then cat ${LOGFILE} >&3
+fi
+
+exit ${ERC}
